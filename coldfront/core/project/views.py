@@ -27,7 +27,6 @@ from coldfront.core.allocation.models import (
     Allocation,
     AllocationStatusChoice,
 )
-from coldfront.core.allocation.utils import generate_guauge_data_from_usage
 from coldfront.core.grant.models import Grant
 from coldfront.core.project.forms import (
     ProjectAddUserForm,
@@ -66,16 +65,21 @@ from coldfront.core.user.utils import CombinedUserSearch
 from coldfront.core.utils.common import get_domain_url, import_from_settings
 from coldfront.core.utils.mail import send_email, send_email_template
 
-EMAIL_ENABLED = import_from_settings("EMAIL_ENABLED", False)
 ALLOCATION_ENABLE_ALLOCATION_RENEWAL = import_from_settings("ALLOCATION_ENABLE_ALLOCATION_RENEWAL", True)
 ALLOCATION_DEFAULT_ALLOCATION_LENGTH = import_from_settings("ALLOCATION_DEFAULT_ALLOCATION_LENGTH", 365)
 
-if EMAIL_ENABLED:
-    EMAIL_DIRECTOR_EMAIL_ADDRESS = import_from_settings("EMAIL_DIRECTOR_EMAIL_ADDRESS")
-    EMAIL_SENDER = import_from_settings("EMAIL_SENDER")
+EMAIL_DIRECTOR_EMAIL_ADDRESS = import_from_settings("EMAIL_DIRECTOR_EMAIL_ADDRESS")
 
 PROJECT_CODE = import_from_settings("PROJECT_CODE", False)
 PROJECT_CODE_PADDING = import_from_settings("PROJECT_CODE_PADDING", False)
+PROJECT_UPDATE_FIELDS = import_from_settings(
+    "PROJECT_UPDATE_FIELDS",
+    [
+        "title",
+        "description",
+        "field_of_science",
+    ],
+)
 
 logger = logging.getLogger(__name__)
 PROJECT_INSTITUTION_EMAIL_MAP = import_from_settings("PROJECT_INSTITUTION_EMAIL_MAP", False)
@@ -137,21 +141,13 @@ class ProjectDetailView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
 
             attributes = [attribute for attribute in attributes_query.filter(proj_attr_type__is_private=False)]
 
-        guage_data = []
         invalid_attributes = []
         for attribute in attributes_with_usage:
             try:
-                guage_data.append(
-                    generate_guauge_data_from_usage(
-                        attribute.proj_attr_type.name,
-                        float(attribute.value),
-                        float(attribute.projectattributeusage.value),
-                    )
-                )
+                float(attribute.value)
+                float(attribute.projectattributeusage.value)
             except ValueError:
-                logger.error(
-                    "Allocation attribute '%s' is not an int but has a usage", attribute.allocation_attribute_type.name
-                )
+                logger.error("Project attribute '%s' is not an int but has a usage", attribute.proj_attr_type.name)
                 invalid_attributes.append(attribute)
 
         for a in invalid_attributes:
@@ -183,8 +179,11 @@ class ProjectDetailView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
                                 "Active",
                             ]
                         )
-                        & Q(allocationuser__user=self.request.user)
-                        & Q(allocationuser__status__name__in=["Active", "PendingEULA"])
+                        & (
+                            Q(allocationuser__user=self.request.user)
+                            & Q(allocationuser__status__name__in=["Active", "PendingEULA"])
+                        )
+                        | Q(project__projectuser__role__name="Manager")
                     )
                     .distinct()
                     .order_by("-end_date")
@@ -198,6 +197,9 @@ class ProjectDetailView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
             if allocation_user:
                 user_status.append(allocation_user.first().status.name)
 
+        note_set = project_obj.projectusermessage_set
+        notes = note_set.all() if self.request.user.is_superuser else note_set.filter(is_private=False)
+        context["notes"] = notes
         context["publications"] = (
             Publication.objects.select_related("source").filter(project=project_obj, status="Active").order_by("-year")
         )
@@ -208,7 +210,6 @@ class ProjectDetailView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
         context["allocations"] = allocations
         context["user_allocation_status"] = user_status
         context["attributes"] = attributes
-        context["guage_data"] = guage_data
         context["attributes_with_usage"] = attributes_with_usage
         context["project_users"] = project_users
 
@@ -557,6 +558,16 @@ class ProjectArchiveProjectView(LoginRequiredMixin, UserPassesTestMixin, Templat
         # project signals
         project_archive.send(sender=self.__class__, project_obj=project)
 
+        # send email to project members
+        email_recipients = project.get_user_emails()
+
+        send_email_template(
+            "Project has been archived",
+            "email/project_archived.txt",
+            {"project": project},
+            email_recipients,
+        )
+
         for allocation in project.allocation_set.filter(status__name="Active"):
             allocation.status = allocation_status_expired
             allocation.end_date = end_date
@@ -593,7 +604,7 @@ class ProjectCreateView(LoginRequiredMixin, UserPassesTestMixin, CreateView):
 
         if PROJECT_CODE:
             """
-            Set the ProjectCode object, if PROJECT_CODE is defined. 
+            Set the ProjectCode object, if PROJECT_CODE is defined.
             If PROJECT_CODE_PADDING is defined, the set amount of padding will be added to PROJECT_CODE.
             """
             project_obj.project_code = generate_project_code(PROJECT_CODE, project_obj.pk, PROJECT_CODE_PADDING or 0)
@@ -611,11 +622,7 @@ class ProjectCreateView(LoginRequiredMixin, UserPassesTestMixin, CreateView):
 class ProjectUpdateView(SuccessMessageMixin, LoginRequiredMixin, UserPassesTestMixin, UpdateView):
     model = Project
     template_name_suffix = "_update_form"
-    fields = [
-        "title",
-        "description",
-        "field_of_science",
-    ]
+    fields = PROJECT_UPDATE_FIELDS
     success_message = "Project updated."
 
     def test_func(self):
@@ -638,7 +645,7 @@ class ProjectUpdateView(SuccessMessageMixin, LoginRequiredMixin, UserPassesTestM
 
         if PROJECT_CODE and project_obj.project_code == "":
             """
-            Updates project code if no value was set, providing the feature is activated. 
+            Updates project code if no value was set, providing the feature is activated.
             """
             project_obj.project_code = generate_project_code(PROJECT_CODE, project_obj.pk, PROJECT_CODE_PADDING or 0)
             project_obj.save(update_fields=["project_code"])
@@ -900,18 +907,33 @@ class ProjectAddUsersView(LoginRequiredMixin, UserPassesTestMixin, View):
                     role_choice = user_form_data.get("role")
                     project_obj.add_user(user_obj, role_choice, signal_sender=self.__class__)
 
+                    email_context = {
+                        "user": user_obj,
+                        "project": project_obj,
+                        "allocations": [],
+                    }
+
                     for allocation in allocations_selected_objs:
                         allocation.add_user(user_obj, signal_sender=self.__class__)
+                        if allocation.allocationuser_set.get(user=user_obj).status.name == "Active":
+                            email_context["allocations"].append(allocation)
+
+                    send_email_template(
+                        "You have been added to a project",
+                        "email/user_added_to_project.txt",
+                        email_context,
+                        [user_obj.email],
+                    )
 
             messages.success(request, "Added {} users to project.".format(added_users_count))
         else:
             if not formset.is_valid():
                 for error in formset.errors:
                     messages.error(request, error)
-
             if not allocation_formset.is_valid():
                 for error in allocation_formset.errors:
                     messages.error(request, error)
+            return redirect(project_obj)
 
         return redirect(project_obj)
 
@@ -1192,44 +1214,40 @@ class ProjectReviewView(LoginRequiredMixin, UserPassesTestMixin, TemplateView):
 
         project_review_status_choice = ProjectReviewStatusChoice.objects.get(name="Pending")
 
-        if project_review_form.is_valid():
-            form_data = project_review_form.cleaned_data
-            project_review_obj = ProjectReview.objects.create(
-                project=project_obj,
-                reason_for_not_updating_project=form_data.get("reason"),
-                status=project_review_status_choice,
-            )
-
-            project_obj.force_review = False
-            project_obj.save()
-
-            domain_url = get_domain_url(self.request)
-            project_review_list_url = "{}{}".format(domain_url, reverse("project-review-list"))
-            project_url = "{}{}".format(domain_url, project_obj.get_absolute_url())
-
-            email_context = {
-                "project": project_obj,
-                "project_url": project_url,
-                "project_review": project_review_obj,
-                "project_review_list_url": project_review_list_url,
-            }
-
-            if EMAIL_ENABLED:
-                send_email_template(
-                    "New project review has been submitted",
-                    "email/new_project_review.txt",
-                    email_context,
-                    EMAIL_SENDER,
-                    [
-                        EMAIL_DIRECTOR_EMAIL_ADDRESS,
-                    ],
-                )
-
-            messages.success(request, "Project reviewed successfully.")
-            return redirect(project_obj)
-        else:
+        if not project_review_form.is_valid():
             messages.error(request, "There was an error in processing  your project review.")
             return redirect(project_obj)
+
+        form_data = project_review_form.cleaned_data
+        project_review_obj = ProjectReview.objects.create(
+            project=project_obj,
+            reason_for_not_updating_project=form_data.get("reason"),
+            status=project_review_status_choice,
+        )
+
+        project_obj.force_review = False
+        project_obj.save()
+
+        domain_url = get_domain_url(self.request)
+        project_review_list_url = "{}{}".format(domain_url, reverse("project-review-list"))
+        project_url = "{}{}".format(domain_url, project_obj.get_absolute_url())
+
+        email_context = {
+            "project": project_obj,
+            "project_url": project_url,
+            "project_review": project_review_obj,
+            "project_review_list_url": project_review_list_url,
+        }
+
+        send_email_template(
+            "New project review has been submitted",
+            "email/new_project_review.txt",
+            email_context,
+            [EMAIL_DIRECTOR_EMAIL_ADDRESS],
+        )
+
+        messages.success(request, "Project reviewed successfully.")
+        return redirect(project_obj)
 
 
 class ProjectReviewListView(LoginRequiredMixin, UserPassesTestMixin, ListView):

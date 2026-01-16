@@ -29,6 +29,7 @@ urlpatterns = [
     path("allocation-summary", portal_views.allocation_summary, name="allocation-summary"),
     path("allocation-by-fos", portal_views.allocation_by_fos, name="allocation-by-fos"),
     path("user/", include("coldfront.core.user.urls")),
+    path("portal/", include("coldfront.core.portal.urls")),
     path("project/", include("coldfront.core.project.urls")),
     path("allocation/", include("coldfront.core.allocation.urls")),
     path("resource/", include("coldfront.core.resource.urls")),
@@ -51,6 +52,9 @@ if "coldfront.plugins.iquota" in settings.INSTALLED_APPS:
 
 if "mozilla_django_oidc" in settings.INSTALLED_APPS:
     urlpatterns.append(path("oidc/", include("mozilla_django_oidc.urls")))
+
+if "coldfront.plugins.slurm" in settings.INSTALLED_APPS:
+    urlpatterns.append(path("slurm/", include("coldfront.plugins.slurm.urls")))
 
 if "django_su.backends.SuBackend" in settings.AUTHENTICATION_BACKENDS:
     urlpatterns.append(path("su/", include("django_su.urls")))

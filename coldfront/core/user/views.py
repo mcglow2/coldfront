@@ -5,13 +5,15 @@
 import logging
 
 from django.contrib import messages
+from django.contrib.auth import logout as auth_logout
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.mixins import LoginRequiredMixin, UserPassesTestMixin
 from django.contrib.auth.models import User
+from django.contrib.auth.views import LogoutView
 from django.db.models import BooleanField, Prefetch
 from django.db.models.expressions import ExpressionWrapper, F, Q
 from django.db.models.functions import Lower
-from django.http import HttpResponseRedirect
+from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, render
 from django.urls import reverse
 from django.utils.decorators import method_decorator
@@ -25,10 +27,7 @@ from coldfront.core.utils.common import import_from_settings
 from coldfront.core.utils.mail import send_email_template
 
 logger = logging.getLogger(__name__)
-EMAIL_ENABLED = import_from_settings("EMAIL_ENABLED", False)
-if EMAIL_ENABLED:
-    EMAIL_SENDER = import_from_settings("EMAIL_SENDER")
-    EMAIL_TICKET_SYSTEM_ADDRESS = import_from_settings("EMAIL_TICKET_SYSTEM_ADDRESS")
+EMAIL_TICKET_SYSTEM_ADDRESS = import_from_settings("EMAIL_TICKET_SYSTEM_ADDRESS")
 
 
 @method_decorator(login_required, name="dispatch")
@@ -218,14 +217,12 @@ class UserUpgradeAccount(LoginRequiredMixin, UserPassesTestMixin, View):
         return super().dispatch(request, *args, **kwargs)
 
     def post(self, request):
-        if EMAIL_ENABLED:
-            send_email_template(
-                "Upgrade Account Request",
-                "email/upgrade_account_request.txt",
-                {"user": request.user},
-                EMAIL_SENDER,
-                [EMAIL_TICKET_SYSTEM_ADDRESS],
-            )
+        send_email_template(
+            "Upgrade Account Request",
+            "email/upgrade_account_request.txt",
+            {"user": request.user},
+            [EMAIL_TICKET_SYSTEM_ADDRESS],
+        )
 
         messages.success(request, "Your request has been sent")
         return HttpResponseRedirect(reverse("user-profile"))
@@ -285,3 +282,14 @@ class UserListAllocations(LoginRequiredMixin, UserPassesTestMixin, TemplateView)
         context["user_dict"] = user_dict
 
         return context
+
+
+class HtmxLogoutView(LogoutView):
+    def post(self, request, *args, **kwargs):
+        auth_logout(request)
+        redirect_to = self.get_success_url()
+        if redirect_to != request.get_full_path():
+            response = HttpResponse(status=204)
+            response["HX-Redirect"] = redirect_to
+            return response
+        return super().get(request, *args, **kwargs)

@@ -19,7 +19,6 @@ from django.forms import formset_factory
 from django.http import HttpResponseBadRequest, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse, reverse_lazy
-from django.utils.html import format_html
 from django.views import View
 from django.views.generic import ListView, TemplateView
 from django.views.generic.edit import CreateView, FormView, UpdateView
@@ -75,6 +74,7 @@ from coldfront.core.utils.mail import (
     send_allocation_admin_email,
     send_allocation_customer_email,
     send_allocation_eula_customer_email,
+    send_email_template,
 )
 
 ALLOCATION_ENABLE_ALLOCATION_RENEWAL = import_from_settings("ALLOCATION_ENABLE_ALLOCATION_RENEWAL", True)
@@ -91,6 +91,7 @@ if INVOICE_ENABLED:
 ALLOCATION_ACCOUNT_ENABLED = import_from_settings("ALLOCATION_ACCOUNT_ENABLED", False)
 ALLOCATION_ACCOUNT_MAPPING = import_from_settings("ALLOCATION_ACCOUNT_MAPPING", {})
 
+EMAIL_SENDER = import_from_settings("EMAIL_SENDER")
 EMAIL_ALLOCATION_EULA_IGNORE_OPT_OUT = import_from_settings("EMAIL_ALLOCATION_EULA_IGNORE_OPT_OUT", False)
 EMAIL_ALLOCATION_EULA_CONFIRMATIONS = import_from_settings("EMAIL_ALLOCATION_EULA_CONFIRMATIONS", False)
 EMAIL_ALLOCATION_EULA_CONFIRMATIONS_CC_MANAGERS = import_from_settings(
@@ -153,17 +154,11 @@ class AllocationDetailView(LoginRequiredMixin, UserPassesTestMixin, TemplateView
 
         allocation_changes = allocation_obj.allocationchangerequest_set.select_related("status").all().order_by("-pk")
 
-        guage_data = []
         invalid_attributes = []
         for attribute in attributes_with_usage:
             try:
-                guage_data.append(
-                    generate_guauge_data_from_usage(
-                        attribute.allocation_attribute_type.name,
-                        float(attribute.value),
-                        float(attribute.allocationattributeusage.value),
-                    )
-                )
+                float(attribute.value)
+                float(attribute.allocationattributeusage.value)
             except ValueError:
                 logger.error(
                     "Allocation attribute '%s' is not an int but has a usage", attribute.allocation_attribute_type.name
@@ -174,15 +169,21 @@ class AllocationDetailView(LoginRequiredMixin, UserPassesTestMixin, TemplateView
             attributes_with_usage.remove(a)
 
         context["allocation_users"] = allocation_users
-        context["guage_data"] = guage_data
         context["attributes_with_usage"] = attributes_with_usage
         context["attributes"] = attributes
         context["allocation_changes"] = allocation_changes
+        context["display_slurm_help"] = "coldfront.plugins.slurm" in settings.INSTALLED_APPS
 
         # Can the user update the project?
         context["is_allowed_to_update_project"] = allocation_obj.project.has_perm(
             self.request.user, ProjectPermission.UPDATE
         )
+        # Can the user edit allocation change requests?
+        # condition was taken from core.allocation.views.AllocationChangeDetailView;
+        # maybe better to make a static method that test_func() in that class will call?
+        context["can_edit_allocation_changes"] = self.request.user.has_perm(
+            "allocation.can_view_all_allocations"
+        ) or allocation_obj.has_perm(self.request.user, AllocationPermission.MANAGER)
 
         noteset = allocation_obj.allocationusernote_set.select_related("author")
         notes = noteset.all() if self.request.user.is_superuser else noteset.filter(is_private=False)
@@ -596,7 +597,7 @@ class AllocationListView(LoginRequiredMixin, ListView):
         return context
 
 
-class AllocationCreateView(LoginRequiredMixin, UserPassesTestMixin, FormView):
+class AllocationCreateView(LoginRequiredMixin, UserPassesTestMixin, CreateView):
     form_class = AllocationForm
     template_name = "allocation/allocation_create.html"
 
@@ -610,27 +611,23 @@ class AllocationCreateView(LoginRequiredMixin, UserPassesTestMixin, FormView):
         return False
 
     def dispatch(self, request, *args, **kwargs):
-        project_obj = get_object_or_404(Project, pk=self.kwargs.get("project_pk"))
+        self.project = get_object_or_404(Project, pk=self.kwargs.get("project_pk"))
 
-        if project_obj.needs_review:
+        if self.project.needs_review:
             messages.error(
                 request, "You cannot request a new allocation because you have to review your project first."
             )
-            return HttpResponseRedirect(reverse("project-detail", kwargs={"pk": project_obj.pk}))
+            return redirect(self.project)
 
-        if project_obj.status.name not in [
-            "Active",
-            "New",
-        ]:
+        if self.project.status.name not in ["Active", "New"]:
             messages.error(request, "You cannot request a new allocation to an archived project.")
-            return HttpResponseRedirect(reverse("project-detail", kwargs={"pk": project_obj.pk}))
+            return redirect(self.project)
 
         return super().dispatch(request, *args, **kwargs)
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        project_obj = get_object_or_404(Project, pk=self.kwargs.get("project_pk"))
-        context["project"] = project_obj
+        context["project"] = self.project
 
         user_resources = get_user_resources(self.request.user)
         resources_form_default_quantities = {}
@@ -662,109 +659,51 @@ class AllocationCreateView(LoginRequiredMixin, UserPassesTestMixin, FormView):
 
         return context
 
-    def get_form(self, form_class=None):
-        """Return an instance of the form to be used in this view."""
-        if form_class is None:
-            form_class = self.get_form_class()
-        return form_class(self.request.user, self.kwargs.get("project_pk"), **self.get_form_kwargs())
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs["request_user"] = self.request.user
+        kwargs["project_pk"] = self.project.pk
+        return kwargs
 
     def form_valid(self, form):
+        redirect = super().form_valid(form)
         form_data = form.cleaned_data
-        project_obj = get_object_or_404(Project, pk=self.kwargs.get("project_pk"))
         resource_obj = form_data.get("resource")
-        justification = form_data.get("justification")
-        quantity = form_data.get("quantity", 1)
         allocation_account = form_data.get("allocation_account", None)
-        # A resource is selected that requires an account name selection but user has no account names
-        if (
-            ALLOCATION_ACCOUNT_ENABLED
-            and resource_obj.name in ALLOCATION_ACCOUNT_MAPPING
-            and AllocationAttributeType.objects.filter(name=ALLOCATION_ACCOUNT_MAPPING[resource_obj.name]).exists()
-            and not allocation_account
-        ):
-            form.add_error(
-                None,
-                format_html(
-                    'You need to create an account name. Create it by clicking the link under the "Allocation account" field.'
-                ),
-            )
-            return self.form_invalid(form)
 
-        allocation_limit_objs = resource_obj.resourceattribute_set.filter(
-            resource_attribute_type__name="allocation_limit"
-        ).first()
-        if allocation_limit_objs:
-            allocation_limit = int(allocation_limit_objs.value)
-            allocation_count = project_obj.allocation_set.filter(
-                resources=resource_obj,
-                status__name__in=["Active", "New", "Renewal Requested", "Paid", "Payment Pending", "Payment Requested"],
-            ).count()
-            if allocation_count >= allocation_limit:
-                form.add_error(None, format_html("Your project is at the allocation limit allowed for this resource."))
-                return self.form_invalid(form)
+        # add users to allocation
+        self.object.add_user(self.project.pi, signal_sender=self.__class__)
+        users = form_data.get("users")
+        for user in users:
+            self.object.add_user(user, signal_sender=self.__class__)
 
-        usernames = form_data.get("users")
-        usernames.append(project_obj.pi.username)
-        usernames = list(set(usernames))
+        # add resources to allocation
+        self.object.resources.add(resource_obj)
+        for linked_resource in resource_obj.linked_resources.all():
+            self.object.resources.add(linked_resource)
 
-        users = [get_user_model().objects.get(username=username) for username in usernames]
-        if project_obj.pi not in users:
-            users.append(project_obj.pi)
-
-        if INVOICE_ENABLED and resource_obj.requires_payment:
-            allocation_status_obj = AllocationStatusChoice.objects.get(name=INVOICE_DEFAULT_STATUS)
-        else:
-            allocation_status_obj = AllocationStatusChoice.objects.get(name="New")
-
-        allocation_obj = Allocation.objects.create(
-            project=project_obj, justification=justification, quantity=quantity, status=allocation_status_obj
-        )
-
-        if ALLOCATION_ENABLE_CHANGE_REQUESTS_BY_DEFAULT:
-            allocation_obj.is_changeable = True
-            allocation_obj.save()
-
-        allocation_obj.resources.add(resource_obj)
-
+        # add allocation account attribute to allocation
         if ALLOCATION_ACCOUNT_ENABLED and allocation_account and resource_obj.name in ALLOCATION_ACCOUNT_MAPPING:
             allocation_attribute_type_obj = AllocationAttributeType.objects.get(
                 name=ALLOCATION_ACCOUNT_MAPPING[resource_obj.name]
             )
-            AllocationAttribute.objects.create(
+            self.object.allocationattribute_set.create(
                 allocation_attribute_type=allocation_attribute_type_obj,
-                allocation=allocation_obj,
-                value=allocation_account,
+                value=allocation_account.name,
             )
 
-        for linked_resource in resource_obj.linked_resources.all():
-            allocation_obj.resources.add(linked_resource)
-
-        allocation_user_active_status = AllocationUserStatusChoice.objects.get(name="Active")
-        if ALLOCATION_EULA_ENABLE:
-            allocation_user_pending_status = AllocationUserStatusChoice.objects.get(name="PendingEULA")
-        for user in users:
-            if ALLOCATION_EULA_ENABLE and not (user == self.request.user):
-                AllocationUser.objects.create(
-                    allocation=allocation_obj, user=user, status=allocation_user_pending_status
-                )
-            else:
-                AllocationUser.objects.create(
-                    allocation=allocation_obj, user=user, status=allocation_user_active_status
-                )
-
         send_allocation_admin_email(
-            allocation_obj,
+            self.object,
             "New Allocation Request",
             "email/new_allocation_request.txt",
             domain_url=get_domain_url(self.request),
         )
-        allocation_new.send(sender=self.__class__, allocation_pk=allocation_obj.pk)
-        return super().form_valid(form)
+        allocation_new.send(sender=self.__class__, allocation_pk=self.object.pk)
+        return redirect
 
     def get_success_url(self):
-        msg = "Allocation requested. It will be available once it is approved."
-        messages.success(self.request, msg)
-        return reverse("project-detail", kwargs={"pk": self.kwargs.get("project_pk")})
+        messages.success(self.request, "Allocation requested. It will be available once it is approved.")
+        return self.project.get_absolute_url()
 
 
 class AllocationAddUsersView(LoginRequiredMixin, UserPassesTestMixin, TemplateView):
@@ -871,19 +810,26 @@ class AllocationAddUsersView(LoginRequiredMixin, UserPassesTestMixin, TemplateVi
 
         users_added_count = 0
 
-        if formset.is_valid():
-            for form in formset:
-                user_form_data = form.cleaned_data
-                if user_form_data["selected"]:
-                    users_added_count += 1
-                    user_obj = get_user_model().objects.get(username=user_form_data.get("username"))
-                    allocation_obj.add_user(user_obj, signal_sender=self.__class__)
-
-            user_plural = "user" if users_added_count == 1 else "users"
-            messages.success(request, f"Added {users_added_count} {user_plural} to allocation.")
-        else:
+        if not formset.is_valid():
             for error in formset.errors:
                 messages.error(request, error)
+            return redirect
+        for form in formset:
+            user_form_data = form.cleaned_data
+            if user_form_data["selected"]:
+                users_added_count += 1
+                user_obj = get_user_model().objects.get(username=user_form_data.get("username"))
+                allocation_obj.add_user(user_obj, signal_sender=self.__class__)
+                if allocation_obj.allocationuser_set.get(user=user_obj).status.name == "Active":
+                    send_email_template(
+                        "You have been added to an allocation",
+                        "email/user_added_to_allocation.txt",
+                        {"user": user_obj, "allocation": allocation_obj},
+                        [user_obj.email],
+                    )
+
+        user_plural = "user" if users_added_count == 1 else "users"
+        messages.success(request, f"Added {users_added_count} {user_plural} to allocation.")
 
         return redirect(allocation_obj)
 

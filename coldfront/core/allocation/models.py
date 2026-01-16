@@ -4,7 +4,6 @@
 
 import datetime
 import logging
-from ast import literal_eval
 from enum import Enum
 
 from django.contrib.auth import get_user_model
@@ -25,6 +24,7 @@ from coldfront.core.project.models import Project, ProjectPermission
 from coldfront.core.resource.models import Resource
 from coldfront.core.utils.common import import_from_settings
 from coldfront.core.utils.mail import build_link, send_email_template
+from coldfront.core.utils.validate import AttributeValidator
 
 logger = logging.getLogger(__name__)
 
@@ -408,7 +408,8 @@ class Allocation(TimeStampedModel):
         Params:
             user (User|AllocationUser): User to remove.
             signal_sender (str): Sender for the `allocation_remove_user` signal.
-            ignore_user_not_found (bool):
+            ignore_user_not_found (bool): If enabled, logs a warning that the allocation user for
+                the provded user couldn't be found and returns. Otherwise, raises `AllocationUser.DoesNotExist`.
         """
         if isinstance(user, AllocationUser):
             allocation_user = user
@@ -417,7 +418,7 @@ class Allocation(TimeStampedModel):
                 allocation_user = self.allocationuser_set.get(user=user)
             except AllocationUser.DoesNotExist:
                 if ignore_user_not_found:
-                    logger.warn(
+                    logger.warning(
                         f"Cannot remove user={str(user)} for allocation pk={self.pk} - AllocationUser not found."
                     )
                     return
@@ -429,6 +430,33 @@ class Allocation(TimeStampedModel):
 
     def get_absolute_url(self):
         return reverse("allocation-detail", kwargs={"pk": self.pk})
+
+    def get_user_emails(self, status_name="Active", ignore_disabled_notifications=False) -> set[str]:
+        """Gets a set of user emails for notifications.
+
+        Params:
+            status_name (str): The name of the AllocationUserStatus to filter on. Defaults to "Active".
+            ignore_disabled_notifications (bool): If True, include project users
+                that have enable_notifications off.
+
+        Returns:
+            set: A set of user emails for notifications.
+        """
+        allocation_users = self.allocationuser_set.filter(status__name=status_name)
+        if ignore_disabled_notifications:
+            user_emails = set(allocation_users.values_list("user__email", flat=True))
+            return user_emails
+
+        users = allocation_users.values_list("user", flat=True)
+        filter_options = {
+            "user__in": users,
+            "staus__name": "Active",
+            "enable_notifications": True,
+        }
+
+        project_users = self.project.projectuser_set.filter(**filter_options)
+        user_emails = set(project_users.values_list("user__email", flat=True))
+        return user_emails
 
 
 class AllocationAdminNote(TimeStampedModel):
@@ -555,37 +583,15 @@ class AllocationAttribute(TimeStampedModel):
 
         expected_value_type = self.allocation_attribute_type.attribute_type.name.strip()
 
+        validator = AttributeValidator(self.value)
         if expected_value_type == "Int":
-            try:
-                if not isinstance(literal_eval(self.value), int):
-                    raise TypeError
-            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError) as e:
-                raise ValidationError(
-                    'Invalid Value "%s" for "%s". Value must be an integer.'
-                    % (self.value, self.allocation_attribute_type.name)
-                ) from e
+            validator.validate_int()
         elif expected_value_type == "Float":
-            try:
-                if not (isinstance(literal_eval(self.value), int) or isinstance(literal_eval(self.value), float)):
-                    raise TypeError
-            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError) as e:
-                raise ValidationError(
-                    'Invalid Value "%s" for "%s". Value must be a float.'
-                    % (self.value, self.allocation_attribute_type.name)
-                ) from e
-        elif expected_value_type == "Yes/No" and self.value not in ["Yes", "No"]:
-            raise ValidationError(
-                'Invalid Value "%s" for "%s". Allowed inputs are "Yes" or "No".'
-                % (self.value, self.allocation_attribute_type.name)
-            )
+            validator.validate_float()
+        elif expected_value_type == "Yes/No":
+            validator.validate_yes_no()
         elif expected_value_type == "Date":
-            try:
-                datetime.datetime.strptime(self.value.strip(), "%Y-%m-%d")
-            except ValueError:
-                raise ValidationError(
-                    'Invalid Value "%s" for "%s". Date must be in format YYYY-MM-DD'
-                    % (self.value, self.allocation_attribute_type.name)
-                )
+            validator.validate_date()
 
     def __str__(self):
         return "%s" % (self.allocation_attribute_type.name)
